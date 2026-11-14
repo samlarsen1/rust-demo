@@ -1,0 +1,81 @@
+[package]
+name = "rust_portfolio_intel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Read-only quantitative portfolio intelligence: incremental SQLite market cache, trend/archetype classification and portfolio gap research."
+license = "MIT OR Apache-2.0"
+publish = false
+default-run = "rust_portfolio_intel"
+
+[lib]
+name = "rust_portfolio_intel"
+# `rlib` for the CLI/tests, `cdylib` so maturin can build a Python extension.
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "rust_portfolio_intel"
+path = "src/main.rs"
+
+[features]
+default = []
+# Python bindings via PyO3 (build with `maturin develop --features extension-module`).
+extension-module = ["dep:pyo3", "pyo3/extension-module"]
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
+pyo3 = { version = "0.30.1", optional = true }
+rusqlite = { version = "0.42.0", features = ["bundled"] }
+rust_decimal = { version = "1.43.0", default-features = false, features = ["std"] }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+proptest = "1.12.0"
+tempfile = "3.27.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# ---------------------------------------------------------------------------
+# Shift-left guardrails. CI runs clippy with `-D warnings`, so every `warn`
+# below is effectively an error in the pipeline.
+# ---------------------------------------------------------------------------
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+unused_must_use = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+# Opinionated groups, enabled wholesale (lower priority so the individual
+# overrides below win).
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# Zero-panic policy for library + binary code. Tests are exempted through
+# `clippy.toml` (`allow-unwrap-in-tests`, `allow-expect-in-tests`, ...).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+float_cmp = "deny"
+dbg_macro = "deny"
+
+# --- Documented overrides --------------------------------------------------
+# Statistics (RSI, volatility, CAGR) are computed in f64 from `usize` counts;
+# the precision loss above 2^52 elements is irrelevant for daily bar series.
+cast_precision_loss = "allow"
+# `TrendTerritory`, `StockArchetype`, ... intentionally repeat the module
+# domain vocabulary; renaming them would hurt readability.
+module_name_repetitions = "allow"
+# Many small constructors/accessors would need `#[must_use]` noise.
+must_use_candidate = "allow"
+# Falsely flags rusqlite `Connection`-holding types; const fns add no value here.
+missing_const_for_fn = "allow"
+# Rewriting every `a + b * c` as `mul_add` obscures the financial formulas; the
+# precision gain is irrelevant at the 4dp resolution prices are stored with.
+suboptimal_flops = "allow"
+# `match` on Option is often clearer than `map_or_else` with two closures.
+option_if_let_else = "allow"

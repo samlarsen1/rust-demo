@@ -1,0 +1,18 @@
+# Build output
+/target/
+
+# Local market cache (never commit data)
+/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite*
+
+# Secrets
+.env*
+
+# Python build artefacts
+__pycache__/
+*.so
+.venv/

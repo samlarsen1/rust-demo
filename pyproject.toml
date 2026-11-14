@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "rust_portfolio_intel"
+description = "Read-only portfolio intelligence (Rust core via PyO3)"
+requires-python = ">=3.9"
+dynamic = ["version"]
+
+[tool.maturin]
+features = ["extension-module"]

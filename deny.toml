@@ -1,0 +1,61 @@
+# cargo-deny configuration — run with `cargo deny check`.
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Check the PyO3 feature too, on the platforms we actually ship for.
+all-features = true
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+# --- RustSec advisories / CVEs -------------------------------------------------
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Add `{ id = "RUSTSEC-YYYY-NNNN", reason = "..." }` only with a written justification.
+ignore = []
+
+# --- Licenses --------------------------------------------------------------------
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+exceptions = [
+    # PyO3 build-time dependency; permissive (Apache-2.0 + LLVM linking exception).
+    { allow = ["Apache-2.0 WITH LLVM-exception"], crate = "target-lexicon" },
+]
+
+[licenses.private]
+# This crate is `publish = false`.
+ignore = true
+
+# --- Bans / duplicate crates -------------------------------------------------------
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+# Transitive duplicates we cannot resolve ourselves. Remove each entry once
+# upstream converges (cargo-deny warns about unused skips).
+skip = [
+    { crate = "syn@2.0.119", reason = "windows-implement/interface (via chrono→iana-time-zone) still on syn 2; thiserror-impl on syn 3" },
+    { crate = "getrandom@0.3.4", reason = "dev-only: tempfile on getrandom 0.3, proptest→rand 0.10 on 0.4" },
+    { crate = "r-efi@5.3.0", reason = "UEFI-only transitive of getrandom 0.3 (dev-only)" },
+]
+
+# --- Sources -------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,5 @@
+[toolchain]
+# Pinned stable toolchain so local, pre-commit and CI results are identical.
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

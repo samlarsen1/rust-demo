@@ -1,0 +1,44 @@
+# Install: `pre-commit install` (done automatically by `just hooks`).
+# Run manually: `pre-commit run --all-files`.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0  # v4.5+ needs pre-commit >= 3.2
+    hooks:
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: local
+    hooks:
+      - id: block-secrets-and-databases
+        name: block .env files and local databases
+        language: fail
+        entry: "Refusing to commit .env files or SQLite databases (secrets / market cache must stay local)"
+        files: '(^|/)\.env(\..*)?$|\.(db|sqlite|sqlite3|db-wal|db-shm|db-journal)$'
+        exclude: '(^|/)\.env\.example$'
+
+      - id: cargo-fmt
+        name: cargo fmt --check
+        language: system
+        entry: cargo fmt --all -- --check
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy (strict)
+        language: system
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        types_or: [rust, toml]
+        pass_filenames: false
+
+      - id: cargo-test-lib
+        name: cargo test --lib
+        language: system
+        entry: cargo test --lib
+        types_or: [rust, toml]
+        pass_filenames: false
