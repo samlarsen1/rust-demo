@@ -12,9 +12,13 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::pipeline::{analyze_portfolio, sync_portfolio};
+use std::time::Duration;
+
+use crate::backfill::{BackfillConfig, run_backfill};
+use crate::pipeline::analyze_portfolio;
 use crate::sample::{sample_portfolio, sample_source};
-use crate::storage::{DEFAULT_HISTORY_DAYS, Store};
+use crate::storage::Store;
+use crate::throttle::{SystemClock, ThrottleConfig};
 
 impl From<crate::Error> for PyErr {
     fn from(e: crate::Error) -> Self {
@@ -24,12 +28,17 @@ impl From<crate::Error> for PyErr {
 
 /// Incrementally sync the sample portfolio into `db_path` (read-only market
 /// data) and return positions plus research notes as plain Python objects.
+///
+/// Requests are throttled to one per `interval_ms` and history is fetched in
+/// `chunk_days` windows, so a cold cache fills slowly rather than in a burst.
 #[pyfunction]
-#[pyo3(signature = (db_path, as_of = None))]
+#[pyo3(signature = (db_path, as_of = None, interval_ms = 1000, chunk_days = 90))]
 fn analyze_sample_portfolio<'py>(
     py: Python<'py>,
     db_path: &str,
     as_of: Option<&str>,
+    interval_ms: u64,
+    chunk_days: u64,
 ) -> PyResult<Bound<'py, PyDict>> {
     let today = match as_of {
         Some(s) => s
@@ -39,12 +48,19 @@ fn analyze_sample_portfolio<'py>(
     };
     let portfolio = sample_portfolio();
     let mut store = Store::open(std::path::Path::new(db_path))?;
-    let syncs = sync_portfolio(
+    let config = BackfillConfig {
+        chunk_days: chunk_days.max(1),
+        throttle: ThrottleConfig::default().with_interval(Duration::from_millis(interval_ms)),
+        ..BackfillConfig::default()
+    };
+    let synced = run_backfill(
         &mut store,
         &sample_source(),
         &portfolio,
         today,
-        DEFAULT_HISTORY_DAYS,
+        &config,
+        &SystemClock::default(),
+        &mut |_| {},
     )?;
     let report = analyze_portfolio(&mut store, &portfolio, today)?;
 
@@ -72,12 +88,12 @@ fn analyze_sample_portfolio<'py>(
         .iter()
         .map(|r| format!("[{}] {}", r.severity, r.message))
         .collect();
-    let fetched: usize = syncs.iter().map(|s| s.bars_fetched).sum();
 
     let out = PyDict::new(py);
     out.set_item("positions", positions)?;
     out.set_item("recommendations", notes)?;
-    out.set_item("bars_fetched", fetched)?;
+    out.set_item("bars_fetched", synced.bars)?;
+    out.set_item("source_requests", synced.requests)?;
     Ok(out)
 }
 

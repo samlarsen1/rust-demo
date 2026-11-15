@@ -124,3 +124,90 @@ fn full_incremental_pipeline_on_disk() {
         .collect();
     assert_eq!(again, before);
 }
+
+#[test]
+fn throttled_backfill_on_disk_matches_oneshot_and_resumes_after_reopen() {
+    use rust_portfolio_intel::backfill::{BackfillConfig, plan, run_backfill};
+    use rust_portfolio_intel::throttle::{ManualClock, ThrottleConfig};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("cache.db");
+    let portfolio = sample_portfolio();
+    let source = sample_source();
+    let today = d(2025, 6, 13);
+    let cfg = BackfillConfig {
+        chunk_days: 120,
+        throttle: ThrottleConfig::default().with_interval(Duration::from_secs(3)),
+        ..BackfillConfig::default()
+    };
+
+    // Process 1: backfill only part of the way (through an earlier date), exit.
+    let partial = d(2024, 6, 1);
+    {
+        let mut store = Store::open(&db).unwrap();
+        run_backfill(
+            &mut store,
+            &source,
+            &portfolio,
+            partial,
+            &cfg,
+            &ManualClock::new(),
+            &mut |_| {},
+        )
+        .unwrap();
+    }
+
+    // Process 2: reopen and continue to `today`; it must start after `partial`.
+    let mut store = Store::open(&db).unwrap();
+    let mut first_requests = vec![];
+    let clock = ManualClock::new();
+    let s = run_backfill(
+        &mut store,
+        &source,
+        &portfolio,
+        today,
+        &cfg,
+        &clock,
+        &mut |p| {
+            if p.round == 1 {
+                first_requests.push(p.report.requested.unwrap().0);
+            }
+        },
+    )
+    .unwrap();
+    assert!(
+        first_requests.iter().all(|f| *f == d(2024, 6, 2)),
+        "{first_requests:?}"
+    );
+    assert!(plan(&store, &portfolio, today, &cfg).unwrap().is_complete());
+
+    // Throttle: with an instant source, total wait = (requests − 1) × interval.
+    let waited: Duration = clock.sleeps().iter().sum();
+    assert_eq!(
+        waited,
+        Duration::from_secs(3) * u32::try_from(s.requests - 1).unwrap()
+    );
+
+    // Compare with an unthrottled one-shot sync.
+    let mut reference = Store::open_in_memory().unwrap();
+    sync_portfolio(
+        &mut reference,
+        &source,
+        &portfolio,
+        today,
+        DEFAULT_HISTORY_DAYS,
+    )
+    .unwrap();
+    for h in &portfolio.holdings {
+        let t = &h.instrument.ticker;
+        // Process 1 started 2 years before `partial`, so the cache holds *more*
+        // history than a fresh one-shot sync; over the shared range it is identical.
+        let want = reference.bars(t).unwrap();
+        let start = want.first().unwrap().date;
+        let all = store.bars(t).unwrap();
+        assert!(all.first().unwrap().date < start);
+        let got: Vec<_> = all.into_iter().filter(|b| b.date >= start).collect();
+        assert_eq!(got, want, "{t}");
+    }
+}

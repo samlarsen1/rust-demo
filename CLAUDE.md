@@ -1,7 +1,7 @@
 # CLAUDE.md — rules for this repository
 
 `rust_portfolio_intel` is a **read-only** portfolio analytics library + CLI
-(Rust, optional PyO3 bindings). Layout: `src/{domain,source,storage,classifier,recommender,pipeline,sample,python}.rs`, integration tests in `tests/`.
+(Rust, optional PyO3 bindings). Layout: `src/{domain,source,storage,throttle,backfill,classifier,recommender,pipeline,sample,python}.rs`, integration tests in `tests/`.
 
 ## Non-negotiable rules
 
@@ -21,6 +21,9 @@
    - write inside one SQLite transaction with idempotent `ON CONFLICT DO UPDATE` upserts,
    - only advance the watermark in the same transaction as the data,
    - ship `proptest` invariant coverage (no duplicate rows, no re-requested dates).
+   - be reached only through `ThrottledSource` / `run_backfill` (rate limiting,
+     backoff, chunked resumable history). Never bulk-fetch history in one burst,
+     and map upstream throttling (HTTP 429) to `Error::RateLimited`.
 5. **No secrets or data in git.** Never create/read/commit `.env*` files or
    `*.db` / `data/` contents. The pre-commit hook blocks them.
 
