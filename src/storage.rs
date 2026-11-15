@@ -78,6 +78,8 @@ pub struct SyncReport {
     pub dividends_fetched: usize,
     /// Total bars held locally after the sync.
     pub cached_bars: usize,
+    /// `true` once the cache for this ticker is complete through `today`.
+    pub complete: bool,
 }
 
 /// One row of a persisted portfolio snapshot.
@@ -125,6 +127,8 @@ impl Store {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        // A background backfill may hold a write lock; wait rather than fail.
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
     }
@@ -145,6 +149,34 @@ impl Store {
             .transpose()
     }
 
+    /// The next uncached date range for `ticker`, capped at `max_days` days.
+    ///
+    /// Cold cache: starts at `today - history_days`. Warm cache: starts at
+    /// `watermark + 1`. Returns `None` when the cache is current.
+    ///
+    /// # Errors
+    /// Fails on SQLite errors or date overflow.
+    pub fn next_window(
+        &self,
+        ticker: &str,
+        today: NaiveDate,
+        history_days: u64,
+        max_days: u64,
+    ) -> Result<Option<(NaiveDate, NaiveDate)>> {
+        let from = match self.watermark(ticker)? {
+            Some(wm) => wm.checked_add_days(Days::new(1)),
+            None => today.checked_sub_days(Days::new(history_days)),
+        }
+        .ok_or_else(|| Error::InvalidInput("date out of range".into()))?;
+        if from > today {
+            return Ok(None);
+        }
+        let to = from
+            .checked_add_days(Days::new(max_days.saturating_sub(1)))
+            .map_or(today, |end| end.min(today));
+        Ok(Some((from, to)))
+    }
+
     /// Incrementally sync one instrument up to and including `today`.
     ///
     /// Cold cache: fetches `today - history_days ..= today`.
@@ -160,31 +192,47 @@ impl Store {
         today: NaiveDate,
         history_days: u64,
     ) -> Result<SyncReport> {
-        let from = match self.watermark(&instrument.ticker)? {
-            Some(wm) => wm.checked_add_days(Days::new(1)),
-            None => today.checked_sub_days(Days::new(history_days)),
-        }
-        .ok_or_else(|| Error::InvalidInput("date out of range".into()))?;
+        self.sync_ticker_window(source, instrument, today, history_days, u64::MAX)
+    }
 
-        if from > today {
+    /// Like [`Self::sync_ticker`] but fetches at most `max_days` calendar days
+    /// per call, advancing the watermark to the end of that chunk. Repeated
+    /// calls walk forward chunk by chunk until the cache reaches `today`, so an
+    /// interrupted backfill resumes exactly where it stopped.
+    ///
+    /// # Errors
+    /// Fails if the source fails or the transaction cannot be committed; in
+    /// that case the watermark is left untouched.
+    pub fn sync_ticker_window(
+        &mut self,
+        source: &dyn MarketDataSource,
+        instrument: &Instrument,
+        today: NaiveDate,
+        history_days: u64,
+        max_days: u64,
+    ) -> Result<SyncReport> {
+        let Some((from, to)) =
+            self.next_window(&instrument.ticker, today, history_days, max_days)?
+        else {
             return Ok(SyncReport {
                 ticker: instrument.ticker.clone(),
                 requested: None,
                 bars_fetched: 0,
                 dividends_fetched: 0,
                 cached_bars: self.bar_count(&instrument.ticker)?,
+                complete: true,
             });
-        }
+        };
 
         // Defensive: never trust a provider to honour the requested range.
-        let in_range = |d: NaiveDate| d >= from && d <= today;
+        let in_range = |d: NaiveDate| d >= from && d <= to;
         let bars: Vec<_> = source
-            .fetch_bars(instrument, from, today)?
+            .fetch_bars(instrument, from, to)?
             .into_iter()
             .filter(|b| b.ticker == instrument.ticker && in_range(b.date))
             .collect();
         let dividends: Vec<_> = source
-            .fetch_dividends(instrument, from, today)?
+            .fetch_dividends(instrument, from, to)?
             .into_iter()
             .filter(|d| d.ticker == instrument.ticker && in_range(d.ex_date))
             .collect();
@@ -198,12 +246,15 @@ impl Store {
             "INSERT INTO sync_watermarks (ticker, last_synced_date, last_bar_date, source)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(ticker) DO UPDATE SET
-                last_synced_date = excluded.last_synced_date,
-                last_bar_date    = COALESCE(excluded.last_bar_date, sync_watermarks.last_bar_date),
+                -- Monotonic: a slower concurrent writer can never move it back.
+                -- (ISO-8601 dates compare correctly as text.)
+                last_synced_date = MAX(sync_watermarks.last_synced_date, excluded.last_synced_date),
+                last_bar_date    = MAX(COALESCE(excluded.last_bar_date, ''),
+                                       COALESCE(sync_watermarks.last_bar_date, '')),
                 source           = excluded.source",
             params![
                 instrument.ticker,
-                today.to_string(),
+                to.to_string(),
                 last_bar.map(|d| d.to_string()),
                 source.name()
             ],
@@ -212,10 +263,11 @@ impl Store {
 
         Ok(SyncReport {
             ticker: instrument.ticker.clone(),
-            requested: Some((from, today)),
+            requested: Some((from, to)),
             bars_fetched: bars.len(),
             dividends_fetched: dividends.len(),
             cached_bars: self.bar_count(&instrument.ticker)?,
+            complete: to >= today,
         })
     }
 
@@ -591,6 +643,104 @@ mod tests {
             .unwrap();
         store.write_snapshot(d(2025, 1, 2), &[row]).unwrap();
         assert_eq!(store.snapshot_len(d(2025, 1, 2)).unwrap(), 1);
+    }
+
+    #[test]
+    fn chunked_sync_walks_forward_without_gaps_or_overlap() {
+        let src = SyntheticSource::new();
+        let today = d(2025, 6, 13);
+        let mut chunked = Store::open_in_memory().unwrap();
+        let mut windows = vec![];
+        loop {
+            let r = chunked
+                .sync_ticker_window(&src, &inst(), today, DEFAULT_HISTORY_DAYS, 90)
+                .unwrap();
+            let Some((from, to)) = r.requested else { break };
+            assert!((to - from).num_days() < 90);
+            assert_eq!(chunked.watermark("UKW").unwrap(), Some(to));
+            windows.push((from, to));
+            assert_eq!(r.complete, to == today);
+        }
+        assert_eq!(windows.first().unwrap().0, d(2023, 6, 14));
+        assert_eq!(windows.last().unwrap().1, today);
+        assert_eq!(windows.len(), 9); // ceil(731 / 90)
+        for w in windows.windows(2) {
+            assert_eq!(w[0].1 + Days::new(1), w[1].0, "gap or overlap");
+        }
+        let mut oneshot = Store::open_in_memory().unwrap();
+        oneshot
+            .sync_ticker(&src, &inst(), today, DEFAULT_HISTORY_DAYS)
+            .unwrap();
+        assert_eq!(chunked.bars("UKW").unwrap(), oneshot.bars("UKW").unwrap());
+        assert_eq!(
+            chunked.dividends("UKW").unwrap(),
+            oneshot.dividends("UKW").unwrap()
+        );
+    }
+
+    /// While connection A is mid-fetch, connection B (another process) syncs
+    /// further ahead. A's later commit must not move the watermark backwards.
+    #[test]
+    fn concurrent_writer_cannot_regress_watermark() {
+        struct Racing<'a> {
+            inner: &'a SyntheticSource,
+            path: std::path::PathBuf,
+            raced: std::cell::Cell<bool>,
+        }
+        impl MarketDataSource for Racing<'_> {
+            fn name(&self) -> &'static str {
+                "racing"
+            }
+            fn fetch_bars(
+                &self,
+                i: &Instrument,
+                f: NaiveDate,
+                t: NaiveDate,
+            ) -> Result<Vec<DailyBar>> {
+                if !self.raced.replace(true) {
+                    let mut other = Store::open(&self.path).unwrap();
+                    while other
+                        .sync_ticker_window(
+                            self.inner,
+                            i,
+                            d(2025, 6, 13),
+                            DEFAULT_HISTORY_DAYS,
+                            90,
+                        )?
+                        .requested
+                        .is_some()
+                    {}
+                }
+                self.inner.fetch_bars(i, f, t)
+            }
+            fn fetch_dividends(
+                &self,
+                i: &Instrument,
+                f: NaiveDate,
+                t: NaiveDate,
+            ) -> Result<Vec<DividendEvent>> {
+                self.inner.fetch_dividends(i, f, t)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.db");
+        let inner = SyntheticSource::new();
+        let racing = Racing {
+            inner: &inner,
+            path: path.clone(),
+            raced: std::cell::Cell::new(false),
+        };
+        let mut a = Store::open(&path).unwrap();
+        let r = a
+            .sync_ticker_window(&racing, &inst(), d(2025, 6, 13), DEFAULT_HISTORY_DAYS, 90)
+            .unwrap();
+        assert_eq!(r.requested.unwrap().1, d(2023, 9, 11)); // A wrote only its first chunk...
+        assert_eq!(a.watermark("UKW").unwrap(), Some(d(2025, 6, 13))); // ...but B's progress stands.
+        let mut oneshot = Store::open_in_memory().unwrap();
+        oneshot
+            .sync_ticker(&inner, &inst(), d(2025, 6, 13), DEFAULT_HISTORY_DAYS)
+            .unwrap();
+        assert_eq!(a.bars("UKW").unwrap(), oneshot.bars("UKW").unwrap());
     }
 
     proptest! {
